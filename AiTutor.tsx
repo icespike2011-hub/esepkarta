@@ -1,0 +1,70 @@
+import { useEffect, useMemo, useState } from "react";
+import { formulas, lessons, notes } from "../data/learningContent";
+import { getStudyPack, saveStudyPack } from "../db";
+import { curriculumTopics, type CurriculumTopic } from "../data/curriculum";
+import type { EsepTask, Language, LocalStudyPack } from "../types";
+
+type Props = { language: Language; tasks: EsepTask[]; onOpenTask: (task: EsepTask) => void };
+type ChatMessage = { role: "user" | "assistant"; text: string };
+type Generated = { title: string; story: string; question: string; answer: number; unit: string; formula: string; explanation: string; conclusion: string };
+
+export function AiTutor({ language, tasks, onOpenTask }: Props) {
+  const [online, setOnline] = useState(typeof navigator === "undefined" || navigator.onLine);
+  const [aiAvailable, setAiAvailable] = useState(false);
+  const [forceOffline, setForceOffline] = useState(false);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [generated, setGenerated] = useState<Generated | null>(null);
+  const [answer, setAnswer] = useState("");
+  const [result, setResult] = useState("");
+  const [topicQuery, setTopicQuery] = useState("");
+  const [studyPack, setStudyPack] = useState<LocalStudyPack | null>(null);
+  const [packOrigin, setPackOrigin] = useState<"ai" | "cache" | "offline" | "" >("");
+  const [packError, setPackError] = useState("");
+  const activeAi = online && aiAvailable && !forceOffline;
+  const ru = language === "ru";
+  const suggestions = useMemo(() => {
+    const query = topicQuery.trim().toLocaleLowerCase();
+    if (!query) return curriculumTopics.slice(0, 3);
+    const tokens = query.split(/[\s,.;:!?]+/).filter(Boolean);
+    return curriculumTopics.map(topic => {
+      const fields = [topic.title_ru, topic.title_kk, topic.objective_ru, ...topic.keywords].map(value => value.toLocaleLowerCase());
+      const score = tokens.reduce((sum, token) => sum + fields.reduce((best, field) => Math.max(best, field.includes(token) ? (field.startsWith(token) ? 3 : 1) : 0), 0), 0);
+      return { topic, score };
+    }).filter(item => item.score > 0).sort((a, b) => b.score - a.score).slice(0, 3).map(item => item.topic);
+  }, [topicQuery]);
+  useEffect(() => { const up = () => setOnline(true); const down = () => setOnline(false); window.addEventListener("online", up); window.addEventListener("offline", down); fetch("/api/tutor").then(r => r.ok ? r.json() : null).then(data => setAiAvailable(Boolean(data?.available))).catch(() => setAiAvailable(false)); return () => { window.removeEventListener("online", up); window.removeEventListener("offline", down); }; }, []);
+  const localReply = (question: string) => { const match = formulas.find(f => (ru ? f.title.ru : f.title.kz).toLocaleLowerCase().split(/[ :]/)[0] && question.toLocaleLowerCase().includes((ru ? f.title.ru : f.title.kz).toLocaleLowerCase().split(/[ :]/)[0])); const card = match ?? formulas[0]; return `${card.title[language]}\n${card.symbols[language]}\n${card.example[language]}\n${ru ? "Попробуй сначала назвать, что требуется найти, и какие данные на это влияют." : "Алдымен нені табу керегін және оған қай деректер әсер ететінін ата."}`; };
+  async function study(topic: CurriculumTopic, action = "") {
+    setBusy(true); setPackError("");
+    try {
+      if (online && aiAvailable && !forceOffline) {
+        if (!action) {
+          const cached = await getStudyPack(topic.id, language);
+          if (cached?.validated) { setStudyPack(cached); setPackOrigin("cache"); setBusy(false); return; }
+        }
+        const response = await fetch("/api/tutor", { method: "POST", headers: { "Content-Type": "application/json" }, signal: AbortSignal.timeout(25_000), body: JSON.stringify({ mode: "study_pack", language, topic_id: topic.id, subject_text: topicQuery, action }) });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error ?? "AI request failed");
+        const pack: LocalStudyPack = { id: `${topic.id}:${language}`, topic_id: topic.id, lang: language, content_json: data.content_json, validated: data.validated === true, usage_count: 1, saved_at: new Date().toISOString() };
+        if (!pack.validated || pack.content_json.tasks.length < 8 || pack.content_json.tasks.some(item => { const c = item.check; const value = c.operator === "+" ? c.a + c.b : c.operator === "-" ? c.a - c.b : c.operator === "*" ? c.a * c.b : c.a / c.b; return Math.abs(value - item.answer) > 1e-8; })) throw new Error(ru ? "Пакет не прошёл проверку. Попробуй ещё раз." : "Жинақ тексеруден өтпеді. Қайталап көр.");
+        await saveStudyPack(pack); setStudyPack(pack); setPackOrigin("ai");
+      } else {
+        const cached = await getStudyPack(topic.id, language);
+        if (cached?.validated) { setStudyPack(cached); setPackOrigin("cache"); }
+        else { setStudyPack(null); setPackOrigin("offline"); }
+      }
+    } catch (error) { setPackError(error instanceof Error ? error.message : (ru ? "Не удалось подготовить пакет." : "Жинақты дайындау мүмкін болмады.")); }
+    finally { setBusy(false); }
+  }
+  async function sendChat(event: React.FormEvent) { event.preventDefault(); const question = input.trim(); if (!question || busy) return; setInput(""); setMessages(old => [...old, { role: "user", text: question }]); setBusy(true); try { if (activeAi) { const response = await fetch("/api/tutor", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "chat", language, message: question, history: messages.slice(-8) }) }); if (!response.ok) throw new Error("offline"); const data = await response.json(); setMessages(old => [...old, { role: "assistant", text: data.text }]); } else setMessages(old => [...old, { role: "assistant", text: localReply(question) }]); } catch { setAiAvailable(false); setMessages(old => [...old, { role: "assistant", text: localReply(question) }]); } finally { setBusy(false); } }
+  async function createExercise() { setBusy(true); setResult(""); try { if (activeAi) { const response = await fetch("/api/tutor", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "exercise", language }) }); if (!response.ok) throw new Error("offline"); const data = await response.json(); setGenerated(data.exercise); } else { const task = tasks[Math.floor(Math.random() * tasks.length)]; onOpenTask(task); } } catch { setAiAvailable(false); const task = tasks[Math.floor(Math.random() * tasks.length)]; onOpenTask(task); } finally { setBusy(false); } }
+  return <section className="tutor-view"><div className="dashboard-heading"><div><span className="eyebrow">{ru ? "ПОМОЩНИК ПО МАТЕМАТИКЕ" : "МАТЕМАТИКА КӨМЕКШІСІ"}</span><h1>{ru ? "Спроси и разберись" : "Сұрап, түсініп ал"}</h1><p>{ru ? "Подскажу ход мысли, объясню формулу или создам новую задачу." : "Шешу жолын ұсынамын, формуланы түсіндіремін немесе жаңа тапсырма құрамын."}</p></div><span className="simulator-orbit">✳</span></div>
+    <article className="panel study-finder"><span className="panel-kicker">{ru ? "НАЙДИ ТЕМУ И УЧИСЬ" : "ТАҚЫРЫПТЫ ТАУЫП, ҮЙРЕН"}</span><h2>{ru ? "Что хочешь повторить?" : "Нені қайталағың келеді?"}</h2><div className="topic-search"><input value={topicQuery} onChange={e => setTopicQuery(e.target.value)} placeholder={ru ? "Например: квадратные корни, площадь…" : "Мысалы: квадрат түбір, аудан…"} /><span>{ru ? "7–9 класс" : "7–9 сынып"}</span></div><div className="topic-suggestions">{suggestions.map(topic => <button key={topic.id} className="topic-suggestion" onClick={() => void study(topic)} disabled={busy}><b>{ru ? topic.title_ru : topic.title_kk}</b><small>{topic.grade} {ru ? "класс" : "сынып"} · {topic.section}</small></button>)}</div>{busy && <div className="pack-skeleton" aria-live="polite"><span></span><b>{ru ? "ИИ готовит конспект и задачи…" : "ЖИ конспект пен тапсырмаларды дайындап жатыр…"}</b></div>}{packError && <p className="pack-error" role="alert">{packError}</p>}{packOrigin === "offline" && <div className="offline-topic-fallback"><b>{ru ? "Офлайн-материалы по близкой теме" : "Жақын тақырып бойынша офлайн материалдар"}</b><p>{ru ? "ИИ-пакета ещё нет на этом устройстве. Ниже доступны сохранённые уроки, формулы и задачи." : "Бұл құрылғыда ЖИ жинағы жоқ. Төменде сақталған сабақтар, формулалар мен тапсырмалар берілген."}</p><button className="button button-outline" onClick={() => setTopicQuery(ru ? "процент площадь график" : "пайыз аудан график")}>{ru ? "Показать готовые материалы" : "Дайын материалдарды көрсету"}</button></div>}{studyPack && <div className="study-pack"><div className="pack-toolbar"><span>{packOrigin === "cache" ? (ru ? "Сохранено на устройстве · офлайн" : "Құрылғыда сақталған · офлайн") : (ru ? "Проверенный пакет · сохранён офлайн" : "Тексерілген жинақ · офлайн сақталды")}</span><button onClick={() => void study(curriculumTopics.find(t => t.id === studyPack.topic_id)!, "simpler")}>{ru ? "Проще" : "Жеңілірек"}</button><button onClick={() => void study(curriculumTopics.find(t => t.id === studyPack.topic_id)!, "different")}>{ru ? "Объясни иначе" : "Басқаша түсіндір"}</button><button onClick={() => void study(curriculumTopics.find(t => t.id === studyPack.topic_id)!, "more")}>{ru ? "Ещё задачи" : "Тағы тапсырмалар"}</button></div><h3>{ru ? "Краткий конспект" : "Қысқаша конспект"}</h3><p>{studyPack.content_json.theory}</p><div className="formula-expression">{studyPack.content_json.formula}</div>{studyPack.content_json.examples.map((example, i) => <details key={i}><summary>{ru ? "Разобранный пример" : "Талданған мысал"} {i + 1}: {example.question}</summary><p>{example.solution}</p></details>)}<h3>{ru ? "Практика · 8 заданий" : "Жаттығу · 8 тапсырма"}</h3>{studyPack.content_json.tasks.map((item, i) => <details className="pack-task" key={i}><summary>{i + 1}. {item.question}</summary><p><b>{ru ? "Подсказка:" : "Тұспал:"}</b> {item.hint}</p><p>{item.solution}</p><small>{ru ? "Типичная ошибка: " : "Жиі кездесетін қате: "}{item.common_mistake}</small></details>)}<h3>{ru ? "Мини-тест" : "Шағын тест"}</h3>{studyPack.content_json.mini_test.map((item, i) => <details key={i}><summary>{i + 1}. {item.question}</summary><p>{ru ? "Ответ:" : "Жауабы:"} {item.answer}</p></details>)}<div className="learning-example"><b>{ru ? "Шпаргалка" : "Шпаргалка"}</b>{studyPack.content_json.cheat_sheet}</div></div>}{!studyPack && !busy && suggestions.length > 0 && <div className="quick-materials"><b>{ru ? "Пока офлайн доступны" : "Офлайн қолжетімді"}</b><span>{formulas.length} {ru ? "формул" : "формула"} · {lessons.length} {ru ? "уроков" : "сабақ"} · {notes.length} {ru ? "конспектов" : "жазба"}</span></div>}</article>
+    <div className="tutor-status panel"><span className={activeAi ? "ai-dot active" : "ai-dot"}></span><div><b>{activeAi ? (ru ? "ИИ-помощник подключён" : "ЖИ көмекшісі қосылды") : (ru ? "Офлайн-помощник" : "Офлайн көмекші")}</b><small>{activeAi ? (ru ? "Можно задавать вопросы и создавать новые задачи." : "Сұрақ қойып, жаңа тапсырма құруға болады.") : (ru ? "Готовые объяснения и задачи доступны без интернета." : "Дайын түсіндірмелер мен тапсырмалар интернетсіз қолжетімді.")}</small></div><label className="mode-switch"><input type="checkbox" checked={forceOffline} onChange={e => setForceOffline(e.target.checked)} />{forceOffline ? (ru ? "Офлайн" : "Офлайн") : (ru ? "Авто" : "Авто")}</label></div>
+    <div className="tutor-grid"><article className="panel chat-panel"><div className="section-heading"><div><span className="panel-kicker">{ru ? "ВОПРОСЫ ПО ТЕМЕ" : "ТАҚЫРЫП БОЙЫНША СҰРАҚТАР"}</span><h2>{ru ? "Чат с помощником" : "Көмекшімен чат"}</h2></div><span>✳</span></div><div className="chat-messages">{messages.length === 0 && <div className="chat-welcome">{ru ? "Например: «Почему при скидке делим на 100?» или «Как читать график?»" : "Мысалы: «Жеңілдікте неге 100-ге бөлеміз?» немесе «Графикті қалай оқимын?»"}</div>}{messages.map((m, i) => <div className={`chat-message ${m.role}`} key={i}>{m.text}</div>)}{busy && <div className="chat-message assistant">{ru ? "Думаю…" : "Ойланып жатырмын…"}</div>}</div><form className="chat-form" onSubmit={sendChat}><input value={input} onChange={e => setInput(e.target.value)} placeholder={ru ? "Напиши вопрос…" : "Сұрағыңды жаз…"} /><button className="button button-primary" disabled={busy || !input.trim()}>{ru ? "Спросить" : "Сұрау"}</button></form></article>
+    <aside className="panel exercise-panel"><span className="panel-kicker">{ru ? "ПРАКТИКА" : "ЖАТТЫҒУ"}</span><h2>{ru ? "Нужна новая задача?" : "Жаңа тапсырма керек пе?"}</h2><p>{ru ? "ИИ составит задачу по теме. Без сети откроется одна из подготовленных задач из офлайн-пакета." : "ЖИ тақырыпқа сай тапсырма құрады. Интернетсіз офлайн жинақтағы дайын тапсырма ашылады."}</p><button className="button button-primary full-button" disabled={busy} onClick={createExercise}>{busy ? (ru ? "Готовлю…" : "Дайындалуда…") : (ru ? "✳ Создать задачу" : "✳ Тапсырма құру")}</button><div className="offline-task-list"><b>{ru ? "Задачи в пакете" : "Жинақтағы тапсырмалар"} · {tasks.length}</b>{tasks.slice(0, 5).map(task => <button key={task.task_id} onClick={() => onOpenTask(task)}>{task.title[language]} <span>↗</span></button>)}</div></aside></div>
+    {generated && <article className="panel generated-card"><span className="panel-kicker">{ru ? "НОВАЯ ЗАДАЧА" : "ЖАҢА ТАПСЫРМА"}</span><h2>{generated.title}</h2><p>{generated.story}</p><b>{generated.question}</b><div className="generated-answer"><input type="number" value={answer} onChange={e => setAnswer(e.target.value)} placeholder={ru ? "Твой ответ" : "Жауабың"} /><button className="button button-primary" onClick={() => setResult(Number(answer) === generated.answer ? (ru ? "Верно! " : "Дұрыс! ") + generated.explanation : (ru ? "Проверь модель: " : "Модельді тексер: ") + generated.formula)}>{ru ? "Проверить" : "Тексеру"}</button></div>{result && <p className="generated-result">{result}</p>}</article>}
+  </section>;
+}
